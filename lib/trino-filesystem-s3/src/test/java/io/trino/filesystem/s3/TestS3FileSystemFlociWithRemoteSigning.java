@@ -1,0 +1,178 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.trino.filesystem.s3;
+
+import com.google.common.io.Closer;
+import io.opentelemetry.api.OpenTelemetry;
+import io.trino.filesystem.TrinoInputFile;
+import io.trino.spi.security.ConnectorIdentity;
+import io.trino.testing.containers.Floci;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.auth.signer.AwsS3V4Signer;
+import software.amazon.awssdk.auth.signer.AwsSignerExecutionAttribute;
+import software.amazon.awssdk.auth.signer.params.AwsS3V4SignerParams;
+import software.amazon.awssdk.core.exception.SdkClientException;
+import software.amazon.awssdk.core.exception.SdkServiceException;
+import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.core.signer.Signer;
+import software.amazon.awssdk.http.SdkHttpFullRequest;
+import software.amazon.awssdk.services.s3.S3Client;
+
+import java.io.IOException;
+import java.util.Optional;
+
+import static io.trino.filesystem.s3.S3FileSystemConfig.S3AuthType.ANONYMOUS;
+import static io.trino.testing.containers.Floci.FLOCI_REGION;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@Testcontainers
+@SuppressWarnings("deprecation")
+public class TestS3FileSystemFlociWithRemoteSigning
+        extends AbstractTestS3FileSystem
+{
+    private static final String BUCKET = "test-bucket";
+    // Floci's enforced-auth mode recognizes the legacy "test" access key.
+    private static final AwsCredentials CREDENTIALS = AwsBasicCredentials.create("test", "test");
+
+    @Container
+    private static final Floci FLOCI = new Floci().withEnv("FLOCI_SERVICES_S3_ENFORCE_AUTH", "true");
+
+    @Override
+    protected void initEnvironment()
+    {
+        try (S3Client client = createS3Client()) {
+            client.createBucket(builder -> builder.bucket(BUCKET));
+        }
+    }
+
+    @Override
+    protected String bucket()
+    {
+        return BUCKET;
+    }
+
+    @Override
+    protected S3Client createS3Client()
+    {
+        return S3Client.builder()
+                .applyMutation(FLOCI::updateClient)
+                .credentialsProvider(StaticCredentialsProvider.create(CREDENTIALS))
+                .build();
+    }
+
+    @Override
+    protected S3FileSystemFactory createS3FileSystemFactory()
+    {
+        return createFileSystemFactory(config().setAuthType(ANONYMOUS), TestS3FileSystemFlociWithRemoteSigning::sign);
+    }
+
+    @Override
+    protected boolean supportsPreSignedUri()
+    {
+        return false;
+    }
+
+    @Test
+    void testUnsignedSignerDoesNotUseClientCredentials()
+            throws IOException
+    {
+        try (TempBlob blob = randomBlobLocation("unsigned-signer"); Closer closer = Closer.create()) {
+            blob.createOrOverwrite("private content");
+            S3FileSystemFactory factory = createFileSystemFactory(
+                    config().setAwsAccessKey(CREDENTIALS.accessKeyId()).setAwsSecretKey(CREDENTIALS.secretAccessKey()),
+                    (request, attributes) -> {
+                        assertAnonymousCredentials(attributes);
+                        return request;
+                    });
+            closer.register(factory::destroy);
+            TrinoInputFile input = factory.create(ConnectorIdentity.ofUser("test")).newInputFile(blob.location());
+
+            assertThatThrownBy(input::exists)
+                    .isInstanceOf(IOException.class)
+                    .cause()
+                    .isInstanceOf(SdkServiceException.class)
+                    .extracting(cause -> ((SdkServiceException) cause).statusCode())
+                    .isEqualTo(403);
+        }
+    }
+
+    @Test
+    void testSignerFailureDoesNotUseClientCredentials()
+            throws IOException
+    {
+        try (TempBlob blob = randomBlobLocation("failed-signer"); Closer closer = Closer.create()) {
+            blob.createOrOverwrite("private content");
+            S3FileSystemFactory factory = createFileSystemFactory(
+                    config().setAwsAccessKey(CREDENTIALS.accessKeyId()).setAwsSecretKey(CREDENTIALS.secretAccessKey()),
+                    (_, attributes) -> {
+                        assertAnonymousCredentials(attributes);
+                        throw SdkClientException.create("Signing denied");
+                    });
+            closer.register(factory::destroy);
+            TrinoInputFile input = factory.create(ConnectorIdentity.ofUser("test")).newInputFile(blob.location());
+
+            assertThatThrownBy(input::exists)
+                    .isInstanceOf(IOException.class)
+                    .hasRootCauseInstanceOf(SdkClientException.class)
+                    .hasRootCauseMessage("Signing denied");
+        }
+    }
+
+    private static S3FileSystemConfig config()
+    {
+        return new S3FileSystemConfig()
+                .setEndpoint(FLOCI.endpoint().toString())
+                .setRegion(FLOCI_REGION)
+                .setPathStyleAccess(true)
+                .setStreamingPartSize(STREAMING_PART_SIZE)
+                .setMaxErrorRetries(1);
+    }
+
+    private static S3FileSystemFactory createFileSystemFactory(S3FileSystemConfig config, Signer signer)
+    {
+        return new S3FileSystemFactory(
+                OpenTelemetry.noop(),
+                config,
+                new S3FileSystemStats(),
+                Optional.of(_ -> Optional.of(signer)));
+    }
+
+    private static SdkHttpFullRequest sign(SdkHttpFullRequest request, ExecutionAttributes attributes)
+    {
+        assertAnonymousCredentials(attributes);
+        return AwsS3V4Signer.create().sign(request, AwsS3V4SignerParams.builder()
+                .awsCredentials(CREDENTIALS)
+                .signingName("s3")
+                .signingRegion(attributes.getAttribute(AwsSignerExecutionAttribute.SIGNING_REGION))
+                .doubleUrlEncode(false)
+                .normalizePath(false)
+                .enablePayloadSigning(false)
+                .enableChunkedEncoding(false)
+                .build());
+    }
+
+    private static void assertAnonymousCredentials(ExecutionAttributes attributes)
+    {
+        AwsCredentials credentials = attributes.getAttribute(AwsSignerExecutionAttribute.AWS_CREDENTIALS);
+        assertThat(credentials).isNotNull();
+        assertThat(credentials.accessKeyId()).isNull();
+        assertThat(credentials.secretAccessKey()).isNull();
+    }
+}
